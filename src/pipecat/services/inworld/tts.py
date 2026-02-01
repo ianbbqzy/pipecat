@@ -840,7 +840,7 @@ class InworldTTSService(AudioContextWordTTSService):
         create_config["maxBufferDelayMs"] = self._buffer_settings["maxBufferDelayMs"] or 3000
         create_config["bufferCharThreshold"] = self._buffer_settings["bufferCharThreshold"] or 250
 
-        create_config["timestampType"] = self._timestamp_type
+        # create_config["timestampType"] = self._timestamp_type
 
         msg = {"create": create_config, "contextId": context_id}
         logger.trace(f"{self}: Sending context create: {create_config}")
@@ -853,7 +853,7 @@ class InworldTTSService(AudioContextWordTTSService):
             context_id: The context ID.
             text: The text to send.
         """
-        msg = {"send_text": {"text": text}, "contextId": context_id}
+        msg = {"send_text": {"text": text, "flush_context": {}}, "contextId": context_id}
         await self.send_with_retry(json.dumps(msg), self._report_error)
 
     async def _send_flush(self, context_id: str):
