@@ -21,6 +21,10 @@ import aiohttp
 from dotenv import load_dotenv
 from loguru import logger
 
+# Suppress verbose logging
+logger.remove()
+logger.add(lambda msg: None)  # Disable all logging
+
 from pipecat.frames.frames import (
     EndFrame,
     Frame,
@@ -134,22 +138,14 @@ class TTFBCollector(FrameProcessor):
                 if isinstance(data, TTFBMetricsData):
                     # Filter out spurious near-zero TTFB values (< 10ms)
                     if data.value > 0.01:
-                        logger.info(f"📊 [{self.service_name}] TTFB: {data.value:.3f}s")
                         self.ttfb_values.append(data.value)
-                    else:
-                        logger.debug(f"📊 Ignoring spurious TTFB: {data.value:.3f}s")
         elif isinstance(frame, TTSStartedFrame):
             self.start_time = time.time()
-            logger.info(f"🎤 [{self.service_name}] TTS Started")
         elif isinstance(frame, TTSStoppedFrame):
-            logger.info(f"🎤 [{self.service_name}] TTS Stopped")
+            pass
         elif isinstance(frame, TTSAudioRawFrame):
             if self.first_audio_time is None:
                 self.first_audio_time = time.time()
-                elapsed = self.first_audio_time - self.start_time if self.start_time else 0
-                logger.info(
-                    f"🔊 [{self.service_name}] First audio frame (elapsed: {elapsed:.3f}s, size: {len(frame.audio)} bytes)"
-                )
                 self.first_chunk_bytes = frame.audio
                 self.sample_rate = frame.sample_rate
 
@@ -208,20 +204,13 @@ class TTFBCollector(FrameProcessor):
         # Save first chunk
         if self.first_chunk_bytes:
             filename = f"{safe_name}_http_first_chunk.wav"
-            filepath = self._save_wav(self.first_chunk_bytes, filename)
-            logger.info(
-                f"💾 [{self.service_name}] Saved first chunk to {filepath} ({len(self.first_chunk_bytes)} bytes)"
-            )
+            self._save_wav(self.first_chunk_bytes, filename)
 
         # Save full audio
         if self.all_audio_chunks:
             full_audio = b"".join(self.all_audio_chunks)
             filename = f"{safe_name}_http_full.wav"
-            filepath = self._save_wav(full_audio, filename)
-            duration_ms = (len(full_audio) / 2 / (self.sample_rate or 24000)) * 1000
-            logger.info(
-                f"💾 [{self.service_name}] Saved full audio to {filepath} ({len(full_audio)} bytes, {duration_ms:.0f}ms)"
-            )
+            self._save_wav(full_audio, filename)
 
     async def _check_audio_done(self):
         """Check if audio has stopped arriving and signal completion."""
@@ -233,7 +222,6 @@ class TTFBCollector(FrameProcessor):
         while True:
             await asyncio.sleep(0.5)
             if self.last_audio_time and (time.time() - self.last_audio_time) > 2.0:
-                logger.info(f"🏁 [{self.service_name}] Audio stream complete")
                 # Save audio files when done
                 self.save_audio_files()
                 self._done_event.set()
@@ -520,10 +508,6 @@ async def _run_benchmark(llm_simulator, tts, collector):
 
     runner = PipelineRunner(handle_sigint=False)
 
-    logger.info(f"Starting benchmark for {collector.service_name}...")
-
-    start_time = time.time()
-
     # Run the pipeline in a task so we can cancel it when audio completes
     run_task = asyncio.create_task(runner.run(task))
 
@@ -540,12 +524,9 @@ async def _run_benchmark(llm_simulator, tts, collector):
     try:
         await asyncio.wait_for(run_task, timeout=5.0)
     except asyncio.TimeoutError:
-        logger.warning("Pipeline took too long to cancel, forcing exit")
+        pass
     except asyncio.CancelledError:
         pass
-
-    total_time = time.time() - start_time
-    logger.info(f"Benchmark for {collector.service_name} completed in {total_time:.2f}s")
 
     return collector.get_results()
 
@@ -581,8 +562,6 @@ async def benchmark_service(
         output_dir=output_dir,
     )
 
-    logger.info(f"Using HTTP-based {service_name}")
-
     async with aiohttp.ClientSession() as session:
         tts = create_tts_fn(session=session, **create_kwargs)
         return await _run_benchmark(llm_simulator, tts, collector)
@@ -590,13 +569,13 @@ async def benchmark_service(
 
 def print_comparison_table(results: List[Dict]):
     """Print a comparison table of benchmark results."""
-    print("\n" + "=" * 80)
-    print("HTTP TTS BENCHMARK COMPARISON")
-    print("=" * 80)
+    print("\n" + "=" * 70)
+    print("HTTP TTS BENCHMARK RESULTS")
+    print("=" * 70)
 
     # Header
-    print(f"{'Service':<20} {'Avg TTFB':<12} {'Min TTFB':<12} {'Max TTFB':<12} {'Samples':<10}")
-    print("-" * 80)
+    print(f"{'Service':<20} {'Avg TTFB':<12} {'Min TTFB':<12} {'Max TTFB':<12} {'Runs':<10}")
+    print("-" * 70)
 
     # Sort by average TTFB (fastest first)
     sorted_results = sorted(results, key=lambda x: x.get("ttfb_avg") or float("inf"))
@@ -610,31 +589,12 @@ def print_comparison_table(results: List[Dict]):
         else:
             print(f"{r['service']:<20} {'N/A':<12} {'N/A':<12} {'N/A':<12} {0:<10}")
 
-    print("=" * 80)
+    print("=" * 70)
 
     # Winner announcement
     if sorted_results and sorted_results[0]["ttfb_avg"] is not None:
         winner = sorted_results[0]
         print(f"\n🏆 Fastest average TTFB: {winner['service']} ({winner['ttfb_avg']:.3f}s)")
-
-    # Individual sentence breakdown
-    print("\n" + "-" * 80)
-    print("Per-Sentence TTFB Breakdown:")
-    print("-" * 80)
-
-    max_sentences = max(len(r["ttfb_values"]) for r in results if r["ttfb_values"])
-
-    for i in range(max_sentences):
-        print(f"\nSentence {i + 1}:")
-        sentence_results = []
-        for r in results:
-            if i < len(r["ttfb_values"]):
-                sentence_results.append((r["service"], r["ttfb_values"][i]))
-
-        # Sort by TTFB for this sentence
-        sentence_results.sort(key=lambda x: x[1])
-        for service, ttfb in sentence_results:
-            print(f"  {service:<20} {ttfb:.3f}s")
 
 
 async def main():
@@ -659,8 +619,8 @@ async def main():
         "-n",
         "--iterations",
         type=int,
-        default=1,
-        help="Number of benchmark iterations to run (default: 1)",
+        default=20,
+        help="Number of benchmark iterations to run (default: 50)",
     )
     parser.add_argument(
         "--services",
@@ -757,16 +717,14 @@ async def main():
     )
     print(f"📝 Text: {text[:50]}..." if len(text) > 50 else f"📝 Text: {text}")
     print(f"⏱️  Token delay: {args.token_delay}ms")
-    print(f"🔄 Iterations: {args.iterations}")
+    print(f"🔄 Runs: {args.iterations}")
     print()
 
     all_results = {service_id: [] for service_id, _, _, _ in available_services}
 
     for iteration in range(args.iterations):
-        if args.iterations > 1:
-            print(f"\n{'='*60}")
-            print(f"ITERATION {iteration + 1} of {args.iterations}")
-            print(f"{'='*60}")
+        # Print progress
+        print(f"\rProgress: {iteration + 1}/{args.iterations}", end="", flush=True)
 
         for service_id, config, api_key, extra_kwargs in available_services:
             try:
@@ -775,16 +733,12 @@ async def main():
                     create_tts_fn=config["create_fn"],
                     text=text,
                     token_delay_ms=args.token_delay,
-                    save_audio=not args.no_save_audio,
+                    save_audio=not args.no_save_audio and iteration == 0,  # Only save audio on first run
                     api_key=api_key,
                     **extra_kwargs,
                 )
                 all_results[service_id].append(result)
             except Exception as e:
-                logger.error(f"Error benchmarking {config['name']}: {e}")
-                import traceback
-
-                traceback.print_exc()
                 all_results[service_id].append(
                     {
                         "service": config["name"],
@@ -800,11 +754,9 @@ async def main():
                 )
 
             # Small delay between services
-            await asyncio.sleep(1.0)
+            await asyncio.sleep(0.5)
 
-        # Small delay between iterations
-        if iteration < args.iterations - 1:
-            await asyncio.sleep(2.0)
+    print()  # New line after progress
 
     # Aggregate results across iterations
     aggregated_results = []
@@ -838,24 +790,6 @@ async def main():
 
     # Print comparison
     print_comparison_table(aggregated_results)
-
-    # Print aggregate stats if multiple iterations
-    if args.iterations > 1:
-        print("\n" + "=" * 80)
-        print(f"AGGREGATE STATISTICS ({args.iterations} iterations)")
-        print("=" * 80)
-        for r in sorted(aggregated_results, key=lambda x: x.get("ttfb_avg") or float("inf")):
-            if r["ttfb_avg"] is not None:
-                # Calculate std dev
-                mean = r["ttfb_avg"]
-                variance = sum((x - mean) ** 2 for x in r["ttfb_values"]) / len(r["ttfb_values"])
-                std_dev = variance**0.5
-                print(f"\n{r['service']}:")
-                print(f"  Total samples: {r['ttfb_count']}")
-                print(f"  Average TTFB:  {r['ttfb_avg']:.3f}s")
-                print(f"  Min TTFB:      {r['ttfb_min']:.3f}s")
-                print(f"  Max TTFB:      {r['ttfb_max']:.3f}s")
-                print(f"  Std Dev:       {std_dev:.3f}s")
 
 
 if __name__ == "__main__":
