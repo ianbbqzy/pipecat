@@ -15,7 +15,7 @@ import asyncio
 import importlib.util
 import os
 from pathlib import Path
-from typing import Any, AsyncIterable, Dict, Iterable, List, Optional, Set, Tuple, Type
+from typing import Any, AsyncIterable, Dict, Iterable, List, Optional, Set, Tuple, Type, TypeVar
 
 from loguru import logger
 from pydantic import BaseModel, ConfigDict, Field
@@ -43,6 +43,7 @@ from pipecat.frames.frames import (
 from pipecat.metrics.metrics import ProcessingMetricsData, TTFBMetricsData
 from pipecat.observers.base_observer import BaseObserver, FramePushed
 from pipecat.observers.turn_tracking_observer import TurnTrackingObserver
+from pipecat.observers.user_bot_latency_observer import UserBotLatencyObserver
 from pipecat.pipeline.base_pipeline import BasePipeline
 from pipecat.pipeline.base_task import BasePipelineTask, PipelineTaskParams
 from pipecat.pipeline.pipeline import Pipeline, PipelineSink, PipelineSource
@@ -60,6 +61,9 @@ HEARTBEAT_MONITOR_SECS = HEARTBEAT_SECS * 10
 IDLE_TIMEOUT_SECS = 300
 
 CANCEL_TIMEOUT_SECS = 20.0
+
+
+T = TypeVar("T")
 
 
 class IdleFrameObserver(BaseObserver):
@@ -284,13 +288,19 @@ class PipelineTask(BasePipelineTask):
             observers = self._params.observers
         observers = observers or []
         self._turn_tracking_observer: Optional[TurnTrackingObserver] = None
+        self._user_bot_latency_observer: Optional[UserBotLatencyObserver] = None
         self._turn_trace_observer: Optional[TurnTraceObserver] = None
         if self._enable_turn_tracking:
             self._turn_tracking_observer = TurnTrackingObserver()
             observers.append(self._turn_tracking_observer)
         if self._enable_tracing and self._turn_tracking_observer:
+            # Create latency observer for tracing
+            self._user_bot_latency_observer = UserBotLatencyObserver()
+            observers.append(self._user_bot_latency_observer)
+            # Create turn trace observer with latency tracking
             self._turn_trace_observer = TurnTraceObserver(
                 self._turn_tracking_observer,
+                latency_tracker=self._user_bot_latency_observer,
                 conversation_id=self._conversation_id,
                 additional_span_attributes=self._additional_span_attributes,
             )
@@ -333,14 +343,16 @@ class PipelineTask(BasePipelineTask):
                 f"{self}: RTVIProcessor and RTVIObserver found, skipping default ones. "
                 "They are both added by default, no need to add them yourself."
             )
+            self._rtvi = external_rtvi
         elif enable_rtvi:
             self._rtvi = rtvi_processor or RTVIProcessor()
+            observers.append(self._rtvi.create_rtvi_observer(params=rtvi_observer_params))
 
+        if self._rtvi:
+            # Automatically call RTVIProcessor.set_bot_ready()
             @self.rtvi.event_handler("on_client_ready")
             async def on_client_ready(rtvi: RTVIProcessor):
                 await rtvi.set_bot_ready()
-
-            observers.append(self._rtvi.create_rtvi_observer(params=rtvi_observer_params))
 
         # This is the idle event. When selected frames are pushed from any
         # processor we consider the pipeline is not idle. We use an observer
@@ -1039,9 +1051,7 @@ class PipelineTask(BasePipelineTask):
 
         return start_metadata
 
-    def _find_processor(
-        self, processor: FrameProcessor, processor_type: Type[FrameProcessor]
-    ) -> Optional[FrameProcessor]:
+    def _find_processor(self, processor: FrameProcessor, processor_type: Type[T]) -> Optional[T]:
         """Recursively find a processor of the given type in the pipeline."""
         if isinstance(processor, processor_type):
             return processor
