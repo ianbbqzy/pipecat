@@ -60,11 +60,13 @@ class InworldHttpTTSService(WordTTSService):
         Parameters:
             temperature: Temperature for speech synthesis.
             speaking_rate: Speaking rate for speech synthesis.
+            timestamp_type: Type of timestamp alignment ("WORD" or "CHARACTER").
             timestamp_transport_strategy: The strategy to use for timestamp transport.
         """
 
         temperature: Optional[float] = None
         speaking_rate: Optional[float] = None
+        timestamp_type: Literal["WORD", "CHARACTER"] = "WORD"
         timestamp_transport_strategy: Literal["ASYNC", "SYNC"] = "ASYNC"
 
     def __init__(
@@ -105,7 +107,7 @@ class InworldHttpTTSService(WordTTSService):
         self._api_key = api_key
         self._session = aiohttp_session
         self._streaming = streaming
-        self._timestamp_type = "WORD"
+        self._timestamp_type = params.timestamp_type
 
         if streaming:
             self._base_url = "https://api.inworld.ai/tts/v1/voice:stream"
@@ -179,11 +181,55 @@ class InworldHttpTTSService(WordTTSService):
             if isinstance(frame, TTSStoppedFrame):
                 await self.add_word_timestamps([("Reset", 0)])
 
+    @staticmethod
+    def _aggregate_chars_to_words(
+        chars: List[str],
+        start_times: List[float],
+        cumulative_time: float,
+    ) -> List[Tuple[str, float]]:
+        """Aggregate character-level timestamps into word-level timestamps.
+
+        Builds words by accumulating characters until a space is encountered,
+        following the same approach as the ElevenLabs plugin.
+
+        Args:
+            chars: List of individual characters from the server.
+            start_times: Corresponding start times (seconds) for each character.
+            cumulative_time: Cumulative time offset for continuity across chunks.
+
+        Returns:
+            List of (word, timestamp) tuples.
+        """
+        word_times: List[Tuple[str, float]] = []
+        current_word = ""
+        word_start_time: Optional[float] = None
+
+        for i, char in enumerate(chars):
+            if char == " ":
+                if current_word:
+                    word_times.append((current_word, word_start_time))
+                    current_word = ""
+                    word_start_time = None
+            else:
+                if word_start_time is None:
+                    word_start_time = cumulative_time + start_times[i]
+                current_word += char
+
+        # Flush any trailing word
+        if current_word and word_start_time is not None:
+            word_times.append((current_word, word_start_time))
+
+        return word_times
+
     def _calculate_word_times(
         self,
         timestamp_info: Dict[str, Any],
     ) -> Tuple[List[Tuple[str, float]], float]:
-        """Calculate word timestamps from Inworld HTTP API word-level response.
+        """Calculate word timestamps from Inworld HTTP API response.
+
+        Parses either word-level or character-level alignment based on the
+        configured ``_timestamp_type``. Character alignments are aggregated
+        into word-level timestamps before returning.
 
         Note: Inworld HTTP provides timestamps that reset for each request.
         We track cumulative time across requests to maintain continuity.
@@ -192,25 +238,37 @@ class InworldHttpTTSService(WordTTSService):
             timestamp_info: The timestamp information from Inworld API.
 
         Returns:
-            Tuple of (word_times, chunk_end_time) where chunk_end_time is the
-            end time of the last word in this chunk (not cumulative).
+            Tuple of (word_times, chunk_end_time) where:
+                - word_times: List of (word, timestamp) tuples
+                - chunk_end_time: End time of the last entry (not cumulative)
         """
         word_times: List[Tuple[str, float]] = []
         chunk_end_time = 0.0
 
-        alignment = timestamp_info.get("wordAlignment", {})
-        words = alignment.get("words", [])
-        start_times = alignment.get("wordStartTimeSeconds", [])
-        end_times = alignment.get("wordEndTimeSeconds", [])
+        if self._timestamp_type == "CHARACTER":
+            alignment = timestamp_info.get("characterAlignment", {})
+            chars = alignment.get("characters", [])
+            start_times = alignment.get("characterStartTimeSeconds", [])
+            end_times = alignment.get("characterEndTimeSeconds", [])
 
-        if words and start_times and len(words) == len(start_times):
-            for i, word in enumerate(words):
-                word_start = self._cumulative_time + start_times[i]
-                word_times.append((word, word_start))
+            if chars and start_times and len(chars) == len(start_times):
+                word_times = self._aggregate_chars_to_words(
+                    chars, start_times, self._cumulative_time
+                )
+                if end_times:
+                    chunk_end_time = end_times[-1]
+        else:
+            alignment = timestamp_info.get("wordAlignment", {})
+            words = alignment.get("words", [])
+            start_times = alignment.get("wordStartTimeSeconds", [])
+            end_times = alignment.get("wordEndTimeSeconds", [])
 
-            # Track the end time of the last word in this chunk
-            if end_times and len(end_times) > 0:
-                chunk_end_time = end_times[-1]
+            if words and start_times and len(words) == len(start_times):
+                for i, word in enumerate(words):
+                    t_start = self._cumulative_time + start_times[i]
+                    word_times.append((word, t_start))
+                if end_times:
+                    chunk_end_time = end_times[-1]
 
         return (word_times, chunk_end_time)
 
@@ -407,7 +465,7 @@ class InworldTTSService(AudioContextWordTTSService):
 
     Uses bidirectional WebSocket for lower latency streaming. Supports multiple
     independent audio contexts per connection (max 5). Outputs LINEAR16 audio
-    with word-level timestamps.
+    with word-level or character-level timestamps.
     """
 
     class InputParams(BaseModel):
@@ -424,6 +482,7 @@ class InworldTTSService(AudioContextWordTTSService):
                 flushing of buffered text to achieve minimal latency while
                 maintaining high quality audio output. If None (default),
                 automatically set based on aggregate_sentences.
+            timestamp_type: Type of timestamp alignment ("WORD" or "CHARACTER").
             timestamp_transport_strategy: The strategy to use for timestamp transport.
         """
 
@@ -433,6 +492,7 @@ class InworldTTSService(AudioContextWordTTSService):
         max_buffer_delay_ms: Optional[int] = None
         buffer_char_threshold: Optional[int] = None
         auto_mode: Optional[bool] = True
+        timestamp_type: Literal["WORD", "CHARACTER"] = "WORD"
         timestamp_transport_strategy: Literal["ASYNC", "SYNC"] = "ASYNC"
 
     def __init__(
@@ -485,7 +545,7 @@ class InworldTTSService(AudioContextWordTTSService):
                 "sampleRateHertz": 0,
             },
         }
-        self._timestamp_type = "WORD"
+        self._timestamp_type = params.timestamp_type
 
         if params.temperature is not None:
             self._settings["temperature"] = params.temperature
@@ -589,6 +649,10 @@ class InworldTTSService(AudioContextWordTTSService):
     def _calculate_word_times(self, timestamp_info: Dict[str, Any]) -> List[Tuple[str, float]]:
         """Calculate word timestamps from Inworld WebSocket API response.
 
+        Parses either word-level or character-level alignment based on the
+        configured ``_timestamp_type``. Character alignments are aggregated
+        into word-level timestamps before returning.
+
         Adds cumulative time offset to maintain monotonically increasing timestamps
         across multiple generations within an agent turn. Also tracks the generation
         end time for updating cumulative time on flush.
@@ -601,24 +665,36 @@ class InworldTTSService(AudioContextWordTTSService):
         """
         word_times: List[Tuple[str, float]] = []
 
-        alignment = timestamp_info.get("wordAlignment", {})
-        words = alignment.get("words", [])
-        start_times = alignment.get("wordStartTimeSeconds", [])
-        end_times = alignment.get("wordEndTimeSeconds", [])
+        if self._timestamp_type == "CHARACTER":
+            alignment = timestamp_info.get("characterAlignment", {})
+            chars = alignment.get("characters", [])
+            start_times = alignment.get("characterStartTimeSeconds", [])
+            end_times = alignment.get("characterEndTimeSeconds", [])
 
-        if words and start_times and len(words) == len(start_times):
-            for i, word in enumerate(words):
-                word_start = self._cumulative_time + start_times[i]
-                word_times.append((word, word_start))
+            if chars and start_times and len(chars) == len(start_times):
+                word_times = InworldHttpTTSService._aggregate_chars_to_words(
+                    chars, start_times, self._cumulative_time
+                )
+                if end_times:
+                    self._generation_end_time = self._cumulative_time + end_times[-1]
+        else:
+            alignment = timestamp_info.get("wordAlignment", {})
+            words = alignment.get("words", [])
+            start_times = alignment.get("wordStartTimeSeconds", [])
+            end_times = alignment.get("wordEndTimeSeconds", [])
 
-            # Track cumulative end time for this generation
-            if end_times and len(end_times) > 0:
-                self._generation_end_time = self._cumulative_time + end_times[-1]
+            if words and start_times and len(words) == len(start_times):
+                for i, word in enumerate(words):
+                    t_start = self._cumulative_time + start_times[i]
+                    word_times.append((word, t_start))
+                if end_times:
+                    self._generation_end_time = self._cumulative_time + end_times[-1]
 
+        if word_times:
             logger.trace(
-                f"{self}: Word timestamps - raw_start_times={start_times}, "
+                f"{self}: {self._timestamp_type} timestamps - "
                 f"cumulative_offset={self._cumulative_time}, "
-                f"adjusted_times={[t for _, t in word_times]}, "
+                f"word_times={word_times}, "
                 f"generation_end_time={self._generation_end_time}"
             )
 
